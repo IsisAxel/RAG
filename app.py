@@ -1,4 +1,12 @@
+import os
 from pathlib import Path
+
+# Désactive la télémétrie anonyme de ChromaDB (appel réseau externe à la création
+# du client). Doit être fait AVANT tout import de chromadb : sur un réseau qui
+# bloque cet appel sortant au lieu de le refuser tout de suite, celui-ci attend
+# le timeout et peut ajouter 30-60s au démarrage — sans compter que ça va à
+# l'encontre du principe "100% local" du projet.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import streamlit as st
 try:
@@ -8,8 +16,13 @@ try:
 except ImportError:
     # Compat avec de très vieilles versions de langchain.
     from langchain.text_splitter import RecursiveCharacterTextSplitter
+try:
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.prompts import PromptTemplate
 from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
 from langchain_community.vectorstores import Chroma
 
 # ---------------------------------------------------------------------------
@@ -46,6 +59,43 @@ TOP_K = 4
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# Configuration du LLM local (Étape 4)
+# ---------------------------------------------------------------------------
+
+# Nom du modèle tel que chargé dans Ollama (`ollama pull mistral` / `ollama pull
+# qwen2.5-coder`, etc.). Modifiable dans la sidebar sans toucher au code.
+DEFAULT_OLLAMA_MODEL = "mistral"
+
+# URL du serveur Ollama local (API REST exposée par `ollama serve`, lancé en
+# tâche de fond quand tu fais `ollama run ...`). Port par défaut : 11434.
+# Explicité ici plutôt que de laisser la valeur par défaut implicite de la
+# classe Ollama, pour bien montrer qu'il s'agit d'un appel réseau 100% local.
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+# Prompt système strict : le LLM ne doit répondre qu'à partir du {context} fourni
+# (les chunks retrouvés à l'Étape 3), jamais à partir de connaissances externes,
+# et doit explicitement dire quand l'information est absente du contexte plutôt
+# que d'halluciner une réponse plausible.
+RAG_PROMPT_TEMPLATE = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "Tu es un assistant documentaire. Réponds à la question UNIQUEMENT à partir "
+        "du contexte ci-dessous, extrait des documents fournis par l'utilisateur.\n\n"
+        "Règles strictes :\n"
+        "- N'utilise aucune connaissance en dehors de ce contexte.\n"
+        "- Si le contexte ne contient pas la réponse, dis exactement : "
+        "\"Je ne trouve pas cette information dans les documents fournis.\"\n"
+        "- Ne fais aucune supposition, n'invente rien.\n"
+        "- Réponds de façon claire et concise, en français.\n\n"
+        "--- Contexte ---\n"
+        "{context}\n"
+        "--- Fin du contexte ---\n\n"
+        "Question : {question}\n"
+        "Réponse :"
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # État de session
@@ -68,6 +118,9 @@ def init_session_state() -> None:
 
     if "indexed_chunk_count" not in st.session_state:
         st.session_state.indexed_chunk_count = 0
+
+    if "ollama_model" not in st.session_state:
+        st.session_state.ollama_model = DEFAULT_OLLAMA_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -201,30 +254,67 @@ def format_semantic_results(chunks: list) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+@st.cache_resource(show_spinner=False)
+def get_llm(model_name: str) -> Ollama:
+    """Client vers le modèle Ollama local (mis en cache par nom de modèle).
+
+    C'est ici que l'URL du serveur Ollama (OLLAMA_BASE_URL) est branchée :
+    chaque appel `.invoke()` sur l'objet retourné fait un POST vers
+    `{OLLAMA_BASE_URL}/api/generate`.
+    """
+    return Ollama(model=model_name, base_url=OLLAMA_BASE_URL)
+
+
+def build_context_text(chunks: list) -> str:
+    """Assemble les chunks retrouvés en un seul bloc de texte pour le prompt,
+    en taguant chacun avec son fichier source."""
+    blocks = [f"[Source : {chunk.metadata.get('source', 'inconnue')}]\n{chunk.page_content}" for chunk in chunks]
+    return "\n\n".join(blocks)
+
+
 def generate_llm_answer(query: str, context_chunks: list) -> str:
+    """Génère une réponse via le LLM local (Ollama), contrainte par `context_chunks`
+    grâce au prompt strict RAG_PROMPT_TEMPLATE."""
+    if not context_chunks:
+        return "Je ne trouve pas cette information dans les documents fournis (aucun extrait pertinent retrouvé)."
+
+    prompt = RAG_PROMPT_TEMPLATE.format(
+        context=build_context_text(context_chunks),
+        question=query,
+    )
+
+    try:
+        llm = get_llm(st.session_state.ollama_model)
+        return llm.invoke(prompt)
+    except Exception as exc:
+        return (
+            f"⚠️ Impossible de contacter le modèle Ollama `{st.session_state.ollama_model}`.\n\n"
+            f"Vérifie qu'Ollama tourne (`ollama serve`) et que le modèle est bien chargé "
+            f"(`ollama pull {st.session_state.ollama_model}`).\n\nErreur : {exc}"
+        )
+
+
+def build_response(query: str) -> tuple:
+    """Construit la réponse à afficher selon le mode actif (toggle).
+
+    Retourne (texte_affiché, chunks_sources) : `chunks_sources` n'est renseigné
+    qu'en mode "Assistant RAG complet" (pour l'expander de transparence) — en
+    mode "Recherche Sémantique pure", les extraits sont déjà le contenu principal
+    de la réponse, un expander séparé serait redondant.
     """
-    Génère une réponse via le LLM local (Ollama), contrainte par `context_chunks`.
-
-    TODO (Étape 4) : construire le prompt (contexte + question) et appeler Ollama
-    (ex: via langchain_community.llms.Ollama ou l'API Ollama directement).
-    """
-    return "*(réponse du LLM à implémenter — Étape suivante)*"
-
-
-def build_response(query: str) -> str:
-    """Construit la réponse à afficher selon le mode actif (toggle)."""
     if not st.session_state.documents_indexed:
-        return "⚠️ Merci d'indexer au moins un document avant de poser une question."
+        return "⚠️ Merci d'indexer au moins un document avant de poser une question.", []
 
     chunks = retrieve_relevant_chunks(query)
 
     if st.session_state.llm_enabled:
         # Mode "Assistant RAG complet" : retrieval + génération LLM.
-        return generate_llm_answer(query, chunks)
+        answer = generate_llm_answer(query, chunks)
+        return answer, chunks
     else:
         # Mode "Recherche Sémantique pure" : aucun appel au LLM, on renvoie les
         # passages bruts trouvés par similarité vectorielle.
-        return format_semantic_results(chunks)
+        return format_semantic_results(chunks), []
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +368,26 @@ def render_sidebar() -> None:
         mode_label = "🤖 Assistant RAG complet" if st.session_state.llm_enabled else "🔎 Recherche Sémantique pure"
         st.caption(f"Mode actif : **{mode_label}**")
 
+        st.session_state.ollama_model = st.text_input(
+            "Modèle Ollama",
+            value=st.session_state.ollama_model,
+            help="Doit correspondre à un modèle déjà tiré via `ollama pull` (ex: mistral, qwen2.5-coder).",
+            disabled=not st.session_state.llm_enabled,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Zone principale (chat)
 # ---------------------------------------------------------------------------
+
+def render_sources_expander(sources: list) -> None:
+    """Élément de transparence (Étape 4) : permet de déplier les extraits de
+    texte ayant servi de contexte à la réponse du LLM."""
+    if not sources:
+        return
+    with st.expander("📎 Vérifier les sources utilisées"):
+        st.markdown(format_semantic_results(sources))
+
 
 def render_chat() -> None:
     st.title("📚 RAG Local")
@@ -291,6 +397,7 @@ def render_chat() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            render_sources_expander(message.get("sources"))
 
     # Saisie utilisateur
     prompt = st.chat_input("Votre question...")
@@ -301,10 +408,11 @@ def render_chat() -> None:
 
         with st.chat_message("assistant"):
             with st.spinner("Réflexion..."):
-                answer = build_response(prompt)
+                answer, sources = build_response(prompt)
             st.markdown(answer)
+            render_sources_expander(sources)
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
 
 
 # ---------------------------------------------------------------------------
