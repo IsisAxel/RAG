@@ -1,0 +1,6 @@
+[server]
+# Désactive le file-watcher : évite que Streamlit rescane tous les modules
+# chargés (dont `transformers`, très lourd) à chaque interaction. Contrepartie :
+# il faut recharger la page manuellement (F5) après une modification du code
+# (au lieu du rerun automatique).
+fileWatcherType = "none"
