@@ -1,4 +1,5 @@
 import os
+import uuid
 from pathlib import Path
 
 # Désactive la télémétrie anonyme de ChromaDB (appel réseau externe à la création
@@ -101,11 +102,18 @@ RAG_PROMPT_TEMPLATE = PromptTemplate(
 # État de session
 # ---------------------------------------------------------------------------
 
+NEW_CHAT_TITLE = "Nouvelle discussion"
+
+
 def init_session_state() -> None:
     """Initialise les variables persistantes de la session Streamlit."""
-    if "messages" not in st.session_state:
-        # Historique de la conversation : liste de {"role": "user"|"assistant", "content": str}
-        st.session_state.messages = []
+    if "chats" not in st.session_state:
+        # Plusieurs discussions en parallèle (façon ChatGPT) :
+        # {chat_id: {"title": str, "messages": [{"role", "content", "sources"?}, ...]}}
+        # Gardé en mémoire pour la durée de vie du serveur (pas de persistance disque).
+        first_id = str(uuid.uuid4())
+        st.session_state.chats = {first_id: {"title": NEW_CHAT_TITLE, "messages": []}}
+        st.session_state.current_chat_id = first_id
 
     if "documents_indexed" not in st.session_state:
         # Passera à True une fois l'indexation (Étape 2/3) effectuée.
@@ -318,11 +326,55 @@ def build_response(query: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Gestion des discussions (plusieurs conversations, façon ChatGPT)
+# ---------------------------------------------------------------------------
+
+def get_current_chat() -> dict:
+    """Retourne le dict {'title', 'messages'} de la discussion active."""
+    return st.session_state.chats[st.session_state.current_chat_id]
+
+
+def start_new_chat() -> None:
+    """Crée une discussion vide et la rend active."""
+    new_id = str(uuid.uuid4())
+    st.session_state.chats[new_id] = {"title": NEW_CHAT_TITLE, "messages": []}
+    st.session_state.current_chat_id = new_id
+
+
+def maybe_set_chat_title(chat: dict, first_message: str) -> None:
+    """Donne un titre à la discussion à partir de la première question posée
+    (tant qu'elle a encore son titre par défaut)."""
+    if chat["title"] == NEW_CHAT_TITLE:
+        chat["title"] = first_message if len(first_message) <= 40 else first_message[:40] + "…"
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
+def render_chat_history_sidebar() -> None:
+    st.header("💬 Discussions")
+
+    if st.button("➕ Nouveau chat", use_container_width=True):
+        start_new_chat()
+        st.rerun()
+
+    # La plus récente en premier.
+    for chat_id in reversed(list(st.session_state.chats.keys())):
+        chat = st.session_state.chats[chat_id]
+        is_active = chat_id == st.session_state.current_chat_id
+        label = f"{'▶️' if is_active else '💬'} {chat['title']}"
+        if st.button(label, key=f"chat_btn_{chat_id}", use_container_width=True, disabled=is_active):
+            st.session_state.current_chat_id = chat_id
+            st.rerun()
+
+    st.divider()
+
+
 def render_sidebar() -> None:
     with st.sidebar:
+        render_chat_history_sidebar()
+
         st.header("📁 Documents")
 
         uploaded_files = st.file_uploader(
@@ -393,8 +445,10 @@ def render_chat() -> None:
     st.title("📚 RAG Local")
     st.caption("Posez une question sur vos documents — 100% local, aucune donnée envoyée à l'extérieur.")
 
-    # Affichage de l'historique
-    for message in st.session_state.messages:
+    chat = get_current_chat()
+
+    # Affichage de l'historique de la discussion active
+    for message in chat["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             render_sources_expander(message.get("sources"))
@@ -402,7 +456,8 @@ def render_chat() -> None:
     # Saisie utilisateur
     prompt = st.chat_input("Votre question...")
     if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        chat["messages"].append({"role": "user", "content": prompt})
+        maybe_set_chat_title(chat, prompt)
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -412,7 +467,7 @@ def render_chat() -> None:
             st.markdown(answer)
             render_sources_expander(sources)
 
-        st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
+        chat["messages"].append({"role": "assistant", "content": answer, "sources": sources})
 
 
 # ---------------------------------------------------------------------------

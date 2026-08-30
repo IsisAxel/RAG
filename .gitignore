@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Streamlit (config.toml reste versionné, secrets.toml jamais)
+.streamlit/secrets.toml
+
+# Données générées par l'application (régénérées en local, ne doivent pas être versionnées)
+chroma_db/
+uploaded_docs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
