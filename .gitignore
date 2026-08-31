@@ -14,6 +14,7 @@ env/
 # Données générées par l'application (régénérées en local, ne doivent pas être versionnées)
 chroma_db/
 uploaded_docs/
+chats.json
 
 # IDE / OS
 .vscode/

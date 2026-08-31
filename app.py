@@ -1,34 +1,37 @@
+"""RAG local (PDF/Markdown/TXT) avec Streamlit, ChromaDB et Ollama.
+
+Deux modes, activables via un toggle dans la sidebar :
+- Recherche Sémantique pure : renvoie les chunks les plus pertinents, sans LLM.
+- Assistant RAG complet : ajoute une génération par un LLM local (Ollama),
+  contrainte à ne répondre qu'à partir du contexte retrouvé.
+"""
+
+import json
 import os
 import uuid
 from pathlib import Path
 
-# Désactive la télémétrie anonyme de ChromaDB (appel réseau externe à la création
-# du client). Doit être fait AVANT tout import de chromadb : sur un réseau qui
-# bloque cet appel sortant au lieu de le refuser tout de suite, celui-ci attend
-# le timeout et peut ajouter 30-60s au démarrage — sans compter que ça va à
-# l'encontre du principe "100% local" du projet.
+# Doit être fait avant l'import de chromadb : désactive un appel réseau de
+# télémétrie qui peut bloquer 30-60s sur un réseau qui le filtre en silence.
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import streamlit as st
 try:
-    # Nom de package actuel (langchain >= 0.1) : le text splitter vit dans son
-    # propre paquet, installé comme dépendance de langchain-community.
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError:
-    # Compat avec de très vieilles versions de langchain.
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 try:
     from langchain_core.prompts import PromptTemplate
 except ImportError:
     from langchain.prompts import PromptTemplate
+try:
+    from langchain_core.documents import Document
+except ImportError:
+    from langchain.schema import Document
 from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 from langchain_community.vectorstores import Chroma
-
-# ---------------------------------------------------------------------------
-# Configuration de la page
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="RAG Local",
@@ -37,47 +40,31 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Configuration du pipeline d'ingestion
+# Configuration
 # ---------------------------------------------------------------------------
 
-UPLOAD_DIR = Path("uploaded_docs")       # fichiers uploadés, réécrits sur disque pour les Loaders
-PERSIST_DIR = Path("chroma_db")          # base vectorielle persistée
+UPLOAD_DIR = Path("uploaded_docs")
+PERSIST_DIR = Path("chroma_db")
 COLLECTION_NAME = "rag_local"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+CHATS_FILE = Path("chats.json")  # historique des discussions, survit à un redémarrage
 
 # Stratégie de chunking :
-# - chunk_size=1000 caractères (~200-250 tokens) : reste proche de la fenêtre native
-#   du modèle d'embedding (all-MiniLM-L6-v2, max_seq_length=256 tokens), pour éviter
-#   qu'un chunk soit tronqué silencieusement lors de la vectorisation.
-# - chunk_overlap=150 caractères (~15%) : préserve le contexte à cheval sur deux chunks
-#   (une phrase coupée en fin de chunk reste compréhensible grâce au chevauchement),
-#   ce qui limite la perte de pertinence au moment de la recherche.
+# - 1000 caractères (~200-250 tokens) : reste sous la fenêtre du modèle
+#   d'embedding (max_seq_length=256 tokens) pour éviter une troncature silencieuse.
+# - 150 caractères de chevauchement (~15%) : évite qu'une phrase coupée en
+#   bord de chunk perde son sens lors de la recherche.
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
-# Nombre de chunks remontés par la recherche sémantique (top-k similarité vectorielle).
-TOP_K = 4
+TOP_K = 4  # nombre de chunks remontés par recherche
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Configuration du LLM local (Étape 4)
-# ---------------------------------------------------------------------------
-
-# Nom du modèle tel que chargé dans Ollama (`ollama pull mistral` / `ollama pull
-# qwen2.5-coder`, etc.). Modifiable dans la sidebar sans toucher au code.
-DEFAULT_OLLAMA_MODEL = "mistral"
-
-# URL du serveur Ollama local (API REST exposée par `ollama serve`, lancé en
-# tâche de fond quand tu fais `ollama run ...`). Port par défaut : 11434.
-# Explicité ici plutôt que de laisser la valeur par défaut implicite de la
-# classe Ollama, pour bien montrer qu'il s'agit d'un appel réseau 100% local.
+DEFAULT_OLLAMA_MODEL = "mistral"  # doit correspondre à un modèle déjà tiré via `ollama pull`
 OLLAMA_BASE_URL = "http://localhost:11434"
 
-# Prompt système strict : le LLM ne doit répondre qu'à partir du {context} fourni
-# (les chunks retrouvés à l'Étape 3), jamais à partir de connaissances externes,
-# et doit explicitement dire quand l'information est absente du contexte plutôt
-# que d'halluciner une réponse plausible.
+# Prompt strict : le LLM ne doit répondre qu'à partir du contexte fourni.
 RAG_PROMPT_TEMPLATE = PromptTemplate(
     input_variables=["context", "question"],
     template=(
@@ -106,23 +93,18 @@ NEW_CHAT_TITLE = "Nouvelle discussion"
 
 
 def init_session_state() -> None:
-    """Initialise les variables persistantes de la session Streamlit."""
+    """Initialise les variables de session au premier chargement de la page."""
     if "chats" not in st.session_state:
-        # Plusieurs discussions en parallèle (façon ChatGPT) :
-        # {chat_id: {"title": str, "messages": [{"role", "content", "sources"?}, ...]}}
-        # Gardé en mémoire pour la durée de vie du serveur (pas de persistance disque).
-        first_id = str(uuid.uuid4())
-        st.session_state.chats = {first_id: {"title": NEW_CHAT_TITLE, "messages": []}}
-        st.session_state.current_chat_id = first_id
+        if not load_chats_from_disk():
+            first_id = str(uuid.uuid4())
+            st.session_state.chats = {first_id: {"title": NEW_CHAT_TITLE, "messages": []}}
+            st.session_state.current_chat_id = first_id
 
     if "documents_indexed" not in st.session_state:
-        # Passera à True une fois l'indexation (Étape 2/3) effectuée.
         st.session_state.documents_indexed = False
 
     if "llm_enabled" not in st.session_state:
-        # True  -> Mode "Assistant RAG complet" (retrieval + génération LLM)
-        # False -> Mode "Recherche Sémantique pure" (retrieval seul)
-        st.session_state.llm_enabled = True
+        st.session_state.llm_enabled = True  # False = Recherche Sémantique pure
 
     if "indexed_chunk_count" not in st.session_state:
         st.session_state.indexed_chunk_count = 0
@@ -132,36 +114,37 @@ def init_session_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline d'ingestion (Étape 2 : extraction -> chunking -> vectorisation)
+# Ingestion : extraction -> chunking -> embeddings -> ChromaDB
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
 def get_embedding_function() -> HuggingFaceEmbeddings:
-    """Charge le modèle d'embeddings local une seule fois (coûteux à instancier)."""
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    """Modèle d'embeddings local, chargé une seule fois (coûteux à instancier)."""
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        # normalize_embeddings=True : requis pour que la distance cosinus soit valide.
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def get_vectorstore() -> Chroma:
-    """Client Chroma persistant unique pour tout le process serveur.
+    """Client Chroma unique et persistant pour tout le process serveur.
 
-    Important sur Windows : Chroma garde ses fichiers d'index (HNSW) ouverts/
-    mappés en mémoire tant que le client Python vit. En créer un nouveau à
-    chaque indexation (et vouloir supprimer l'ancien dossier sur disque)
-    provoque une erreur "file in use". En réutilisant toujours le même client
-    (mis en cache), on peut vider puis repeupler la collection sans jamais
-    toucher aux fichiers directement.
+    Sur Windows, Chroma garde son index (HNSW) ouvert en mémoire tant que le
+    client Python vit : en recréer un à chaque indexation empêcherait de
+    supprimer l'ancien dossier ("file in use"). D'où le cache_resource.
     """
     return Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=get_embedding_function(),
         persist_directory=str(PERSIST_DIR),
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
 
 def save_uploaded_file(uploaded_file) -> Path:
-    """Écrit un fichier uploadé (en mémoire) sur disque pour que les DocumentLoaders
-    de LangChain (qui attendent un chemin) puissent le lire."""
+    """Écrit un fichier uploadé sur disque (les DocumentLoaders attendent un chemin)."""
     file_path = UPLOAD_DIR / uploaded_file.name
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -169,8 +152,7 @@ def save_uploaded_file(uploaded_file) -> Path:
 
 
 def load_document(file_path: Path) -> list:
-    """Extrait le texte d'un fichier en un ou plusieurs Document LangChain,
-    en choisissant le loader adapté à son extension."""
+    """Extrait le texte d'un fichier en Document(s) LangChain, selon son extension."""
     suffix = file_path.suffix.lower()
 
     if suffix == ".pdf":
@@ -181,10 +163,8 @@ def load_document(file_path: Path) -> list:
         raise ValueError(f"Format non supporté : {suffix}")
 
     docs = loader.load()
-
-    # On force la métadonnée "source" au nom de fichier original (et non le chemin
-    # temporaire sur disque), pour un affichage propre des sources en Étape 3.
     for doc in docs:
+        # Nom de fichier original plutôt que le chemin temporaire sur disque.
         doc.metadata["source"] = file_path.name
 
     return docs
@@ -201,24 +181,24 @@ def split_documents(documents: list) -> list:
 
 
 def index_documents(uploaded_files) -> None:
-    """Pipeline complet d'ingestion : extraction -> chunking -> embeddings -> ChromaDB.
+    """Pipeline complet d'ingestion : extraction -> chunking -> embeddings -> stockage.
 
-    Réindexe entièrement la base à chaque appel à partir des fichiers actuellement
-    présents dans le file_uploader (approche simple, adaptée à l'échelle du projet).
+    Réindexe entièrement la base à chaque appel, à partir des fichiers
+    actuellement présents dans le file_uploader.
     """
-    # Extraction : un ou plusieurs Document par fichier, métadonnées (source) conservées.
     all_documents = []
     for uploaded_file in uploaded_files:
         file_path = save_uploaded_file(uploaded_file)
         all_documents.extend(load_document(file_path))
 
-    # Chunking
     chunks = split_documents(all_documents)
+    if not chunks:
+        raise ValueError(
+            "Aucun texte exploitable extrait des fichiers sélectionnés "
+            "(PDF scanné/composé d'images, ou fichier vide ?)."
+        )
 
-    # Vectorisation + stockage. On repart d'une collection vide à chaque indexation
-    # (pour éviter les doublons entre deux clics successifs), en vidant son contenu
-    # via l'API Chroma plutôt qu'en supprimant les fichiers sur disque (cf. docstring
-    # de get_vectorstore).
+    # On repart d'une collection vide pour éviter les doublons entre deux indexations.
     vectorstore = get_vectorstore()
     existing_ids = vectorstore.get()["ids"]
     if existing_ids:
@@ -230,59 +210,43 @@ def index_documents(uploaded_files) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Génération de réponse (à implémenter dans les étapes suivantes)
+# Génération de réponse : retrieval + (optionnel) LLM
 # ---------------------------------------------------------------------------
 
 def retrieve_relevant_chunks(query: str) -> list:
-    """
-    Recherche sémantique dans le vector store (peuplé par index_documents — Étape 2).
-
-    Aucun modèle génératif n'est appelé ici : on se contente d'encoder `query`
-    avec le même modèle d'embeddings que celui utilisé à l'indexation, puis de
-    comparer par similarité vectorielle aux chunks stockés dans ChromaDB.
-
-    Retourne les TOP_K Document LangChain les plus proches (chunk.page_content
-    = texte du fragment, chunk.metadata["source"] = nom du fichier d'origine).
-    """
+    """Renvoie les TOP_K chunks les plus proches de `query` par similarité vectorielle."""
     if not st.session_state.documents_indexed:
         return []
+
     return get_vectorstore().similarity_search(query, k=TOP_K)
 
 
 def format_semantic_results(chunks: list) -> str:
-    """Formate les résultats du mode 'Recherche Sémantique pure' : le contenu
-    brut de chaque chunk, précédé du nom exact du fichier source (métadonnées)."""
+    """Formate les chunks bruts pour l'affichage : contenu + fichier source."""
     if not chunks:
         return "Aucun passage pertinent trouvé dans les documents indexés."
 
     blocks = []
     for i, chunk in enumerate(chunks, start=1):
         source = chunk.metadata.get("source", "source inconnue")
-        blocks.append(f"**Extrait {i}** — 📄 `{source}`\n\n{chunk.page_content}")
+        blocks.append(f"**Extrait {i}** — `{source}`\n\n{chunk.page_content}")
     return "\n\n---\n\n".join(blocks)
 
 
 @st.cache_resource(show_spinner=False)
 def get_llm(model_name: str) -> Ollama:
-    """Client vers le modèle Ollama local (mis en cache par nom de modèle).
-
-    C'est ici que l'URL du serveur Ollama (OLLAMA_BASE_URL) est branchée :
-    chaque appel `.invoke()` sur l'objet retourné fait un POST vers
-    `{OLLAMA_BASE_URL}/api/generate`.
-    """
+    """Client vers le modèle Ollama local (mis en cache par nom de modèle)."""
     return Ollama(model=model_name, base_url=OLLAMA_BASE_URL)
 
 
 def build_context_text(chunks: list) -> str:
-    """Assemble les chunks retrouvés en un seul bloc de texte pour le prompt,
-    en taguant chacun avec son fichier source."""
+    """Assemble les chunks en un bloc de texte pour le prompt, tagué par fichier source."""
     blocks = [f"[Source : {chunk.metadata.get('source', 'inconnue')}]\n{chunk.page_content}" for chunk in chunks]
     return "\n\n".join(blocks)
 
 
 def generate_llm_answer(query: str, context_chunks: list) -> str:
-    """Génère une réponse via le LLM local (Ollama), contrainte par `context_chunks`
-    grâce au prompt strict RAG_PROMPT_TEMPLATE."""
+    """Génère une réponse via Ollama, contrainte au contexte par RAG_PROMPT_TEMPLATE."""
     if not context_chunks:
         return "Je ne trouve pas cette information dans les documents fournis (aucun extrait pertinent retrouvé)."
 
@@ -296,54 +260,139 @@ def generate_llm_answer(query: str, context_chunks: list) -> str:
         return llm.invoke(prompt)
     except Exception as exc:
         return (
-            f"⚠️ Impossible de contacter le modèle Ollama `{st.session_state.ollama_model}`.\n\n"
+            f"Impossible de contacter le modèle Ollama `{st.session_state.ollama_model}`.\n\n"
             f"Vérifie qu'Ollama tourne (`ollama serve`) et que le modèle est bien chargé "
             f"(`ollama pull {st.session_state.ollama_model}`).\n\nErreur : {exc}"
         )
 
 
 def build_response(query: str) -> tuple:
-    """Construit la réponse à afficher selon le mode actif (toggle).
+    """Construit la réponse selon le mode actif.
 
-    Retourne (texte_affiché, chunks_sources) : `chunks_sources` n'est renseigné
-    qu'en mode "Assistant RAG complet" (pour l'expander de transparence) — en
-    mode "Recherche Sémantique pure", les extraits sont déjà le contenu principal
-    de la réponse, un expander séparé serait redondant.
+    Retourne (texte_affiché, chunks_sources) : `chunks_sources` n'est rempli
+    qu'en mode Assistant RAG complet, pour l'expander de transparence (en mode
+    Recherche Sémantique, les extraits sont déjà le contenu principal affiché).
     """
     if not st.session_state.documents_indexed:
-        return "⚠️ Merci d'indexer au moins un document avant de poser une question.", []
+        return "Merci d'indexer au moins un document avant de poser une question.", []
 
     chunks = retrieve_relevant_chunks(query)
 
     if st.session_state.llm_enabled:
-        # Mode "Assistant RAG complet" : retrieval + génération LLM.
         answer = generate_llm_answer(query, chunks)
         return answer, chunks
     else:
-        # Mode "Recherche Sémantique pure" : aucun appel au LLM, on renvoie les
-        # passages bruts trouvés par similarité vectorielle.
         return format_semantic_results(chunks), []
 
 
 # ---------------------------------------------------------------------------
-# Gestion des discussions (plusieurs conversations, façon ChatGPT)
+# Discussions (plusieurs conversations en parallèle, façon ChatGPT)
+# Persistées sur disque dans CHATS_FILE : survivent à un redémarrage du serveur.
 # ---------------------------------------------------------------------------
 
+def _message_to_json(message: dict) -> dict:
+    """Un message en dict JSON-sérialisable (les sources sont des Document LangChain)."""
+    return {
+        "role": message["role"],
+        "content": message["content"],
+        "sources": [
+            {"page_content": doc.page_content, "metadata": doc.metadata}
+            for doc in message.get("sources") or []
+        ],
+    }
+
+
+def _message_from_json(data: dict) -> dict:
+    """Reconstruit un message (et ses Document sources) depuis le JSON sauvegardé."""
+    return {
+        "role": data["role"],
+        "content": data["content"],
+        "sources": [Document(page_content=s["page_content"], metadata=s["metadata"]) for s in data["sources"]],
+    }
+
+
+def save_chats_to_disk() -> None:
+    """Écrit toutes les discussions dans CHATS_FILE."""
+    payload = {
+        "current_chat_id": st.session_state.current_chat_id,
+        "chats": {
+            chat_id: {
+                "title": chat["title"],
+                "messages": [_message_to_json(m) for m in chat["messages"]],
+            }
+            for chat_id, chat in st.session_state.chats.items()
+        },
+    }
+    CHATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_chats_from_disk() -> bool:
+    """Recharge les discussions depuis CHATS_FILE dans st.session_state. False si rien à charger."""
+    if not CHATS_FILE.exists():
+        return False
+
+    try:
+        payload = json.loads(CHATS_FILE.read_text(encoding="utf-8"))
+        chats = {
+            chat_id: {
+                "title": chat["title"],
+                "messages": [_message_from_json(m) for m in chat["messages"]],
+            }
+            for chat_id, chat in payload["chats"].items()
+        }
+    except (json.JSONDecodeError, KeyError, OSError):
+        return False
+
+    if not chats:
+        return False
+
+    st.session_state.chats = chats
+    current_id = payload.get("current_chat_id")
+    st.session_state.current_chat_id = current_id if current_id in chats else next(iter(chats))
+    return True
+
+
 def get_current_chat() -> dict:
-    """Retourne le dict {'title', 'messages'} de la discussion active."""
+    """Discussion actuellement affichée : {'title': str, 'messages': list}."""
     return st.session_state.chats[st.session_state.current_chat_id]
 
 
+def find_empty_chat_id() -> str | None:
+    """Id d'une discussion sans aucun message, s'il en existe une."""
+    for chat_id, chat in st.session_state.chats.items():
+        if not chat["messages"]:
+            return chat_id
+    return None
+
+
 def start_new_chat() -> None:
-    """Crée une discussion vide et la rend active."""
-    new_id = str(uuid.uuid4())
-    st.session_state.chats[new_id] = {"title": NEW_CHAT_TITLE, "messages": []}
-    st.session_state.current_chat_id = new_id
+    """Crée une discussion vide et la rend active — ou réutilise celle déjà vide s'il y en a une."""
+    existing_empty_id = find_empty_chat_id()
+    if existing_empty_id is not None:
+        st.session_state.current_chat_id = existing_empty_id
+    else:
+        new_id = str(uuid.uuid4())
+        st.session_state.chats[new_id] = {"title": NEW_CHAT_TITLE, "messages": []}
+        st.session_state.current_chat_id = new_id
+    save_chats_to_disk()
+
+
+def delete_chat(chat_id: str) -> None:
+    """Supprime une discussion. Bascule sur une autre si c'était la discussion active."""
+    del st.session_state.chats[chat_id]
+
+    if not st.session_state.chats:
+        new_id = str(uuid.uuid4())
+        st.session_state.chats[new_id] = {"title": NEW_CHAT_TITLE, "messages": []}
+        st.session_state.current_chat_id = new_id
+    elif st.session_state.current_chat_id == chat_id:
+        st.session_state.current_chat_id = next(iter(st.session_state.chats))
+
+    save_chats_to_disk()
 
 
 def maybe_set_chat_title(chat: dict, first_message: str) -> None:
-    """Donne un titre à la discussion à partir de la première question posée
-    (tant qu'elle a encore son titre par défaut)."""
+    """Donne un titre à la discussion à partir de la première question posée."""
     if chat["title"] == NEW_CHAT_TITLE:
         chat["title"] = first_message if len(first_message) <= 40 else first_message[:40] + "…"
 
@@ -353,79 +402,85 @@ def maybe_set_chat_title(chat: dict, first_message: str) -> None:
 # ---------------------------------------------------------------------------
 
 def render_chat_history_sidebar() -> None:
-    st.header("💬 Discussions")
+    """Bouton "Nouveau chat" + liste des discussions précédentes (plus récente en premier)."""
+    with st.container(border=True):
+        st.subheader("Discussions", anchor=False)
 
-    if st.button("➕ Nouveau chat", use_container_width=True):
-        start_new_chat()
-        st.rerun()
-
-    # La plus récente en premier.
-    for chat_id in reversed(list(st.session_state.chats.keys())):
-        chat = st.session_state.chats[chat_id]
-        is_active = chat_id == st.session_state.current_chat_id
-        label = f"{'▶️' if is_active else '💬'} {chat['title']}"
-        if st.button(label, key=f"chat_btn_{chat_id}", use_container_width=True, disabled=is_active):
-            st.session_state.current_chat_id = chat_id
+        if st.button("Nouveau chat", type="primary", use_container_width=True):
+            start_new_chat()
             st.rerun()
 
-    st.divider()
+        for chat_id in reversed(list(st.session_state.chats.keys())):
+            chat = st.session_state.chats[chat_id]
+            is_active = chat_id == st.session_state.current_chat_id
+            label = f"● {chat['title']}" if is_active else f"○ {chat['title']}"
+
+            col_select, col_delete = st.columns([5, 1])
+            with col_select:
+                if st.button(label, key=f"chat_btn_{chat_id}", use_container_width=True, disabled=is_active):
+                    st.session_state.current_chat_id = chat_id
+                    save_chats_to_disk()
+                    st.rerun()
+            with col_delete:
+                if st.button("×", key=f"chat_del_{chat_id}", use_container_width=True):
+                    delete_chat(chat_id)
+                    st.rerun()
 
 
 def render_sidebar() -> None:
+    """Sidebar complète : discussions, upload/indexation des documents, réglages du mode."""
     with st.sidebar:
         render_chat_history_sidebar()
 
-        st.header("📁 Documents")
+        with st.container(border=True):
+            st.subheader("Documents", anchor=False)
 
-        uploaded_files = st.file_uploader(
-            label="Charger des documents",
-            type=["pdf", "md", "txt"],
-            accept_multiple_files=True,
-            help="Formats acceptés : PDF, Markdown, TXT",
-        )
+            uploaded_files = st.file_uploader(
+                label="Charger des documents",
+                type=["pdf", "md", "txt"],
+                accept_multiple_files=True,
+                help="Formats acceptés : PDF, Markdown, TXT",
+                label_visibility="collapsed",
+            )
 
-        if st.button("🔍 Indexer les documents", use_container_width=True):
-            if uploaded_files:
-                with st.spinner("Indexation en cours... (le premier lancement télécharge le modèle d'embeddings)"):
-                    try:
-                        index_documents(uploaded_files)
-                    except Exception as exc:
-                        st.error(f"Erreur pendant l'indexation : {exc}")
-                    else:
-                        st.success(
-                            f"{len(uploaded_files)} document(s) indexé(s) "
-                            f"— {st.session_state.indexed_chunk_count} chunks générés."
-                        )
-            else:
-                st.warning("Aucun fichier sélectionné.")
+            if st.button("Indexer les documents", type="primary", use_container_width=True):
+                if uploaded_files:
+                    with st.spinner("Indexation en cours... (le premier lancement télécharge le modèle d'embeddings)"):
+                        try:
+                            index_documents(uploaded_files)
+                        except Exception as exc:
+                            st.error(f"Erreur pendant l'indexation : {exc}")
+                        else:
+                            st.success(
+                                f"{len(uploaded_files)} document(s) indexé(s) "
+                                f"— {st.session_state.indexed_chunk_count} chunks générés."
+                            )
+                else:
+                    st.warning("Aucun fichier sélectionné.")
 
-        if st.session_state.documents_indexed:
-            st.caption("✅ Base documentaire prête")
-        else:
-            st.caption("⏳ Aucun document indexé")
+            st.caption("Base documentaire prête" if st.session_state.documents_indexed else "Aucun document indexé")
 
-        st.divider()
+        with st.container(border=True):
+            st.subheader("Mode de fonctionnement", anchor=False)
 
-        st.header("⚙️ Mode de fonctionnement")
+            st.session_state.llm_enabled = st.toggle(
+                "Assistant RAG complet (LLM activé)",
+                value=st.session_state.llm_enabled,
+                help=(
+                    "Activé : recherche + génération de réponse par le LLM local.\n"
+                    "Désactivé : recherche sémantique pure (passages bruts, sans LLM)."
+                ),
+            )
 
-        st.session_state.llm_enabled = st.toggle(
-            "Assistant RAG complet (LLM activé)",
-            value=st.session_state.llm_enabled,
-            help=(
-                "Activé : recherche + génération de réponse par le LLM local.\n"
-                "Désactivé : recherche sémantique pure (passages bruts, sans LLM)."
-            ),
-        )
+            mode_label = "Assistant RAG complet" if st.session_state.llm_enabled else "Recherche Sémantique pure"
+            st.caption(f"Mode actif : **{mode_label}**")
 
-        mode_label = "🤖 Assistant RAG complet" if st.session_state.llm_enabled else "🔎 Recherche Sémantique pure"
-        st.caption(f"Mode actif : **{mode_label}**")
-
-        st.session_state.ollama_model = st.text_input(
-            "Modèle Ollama",
-            value=st.session_state.ollama_model,
-            help="Doit correspondre à un modèle déjà tiré via `ollama pull` (ex: mistral, qwen2.5-coder).",
-            disabled=not st.session_state.llm_enabled,
-        )
+            st.session_state.ollama_model = st.text_input(
+                "Modèle Ollama",
+                value=st.session_state.ollama_model,
+                help="Doit correspondre à un modèle déjà tiré via `ollama pull` (ex: mistral, qwen2.5-coder).",
+                disabled=not st.session_state.llm_enabled,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -433,27 +488,25 @@ def render_sidebar() -> None:
 # ---------------------------------------------------------------------------
 
 def render_sources_expander(sources: list) -> None:
-    """Élément de transparence (Étape 4) : permet de déplier les extraits de
-    texte ayant servi de contexte à la réponse du LLM."""
+    """Élément de transparence : dépliant listant les extraits ayant servi de contexte au LLM."""
     if not sources:
         return
-    with st.expander("📎 Vérifier les sources utilisées"):
+    with st.expander("Vérifier les sources utilisées"):
         st.markdown(format_semantic_results(sources))
 
 
 def render_chat() -> None:
-    st.title("📚 RAG Local")
+    """Zone principale : historique de la discussion active + saisie utilisateur."""
+    st.title("RAG Local", anchor=False)
     st.caption("Posez une question sur vos documents — 100% local, aucune donnée envoyée à l'extérieur.")
 
     chat = get_current_chat()
 
-    # Affichage de l'historique de la discussion active
     for message in chat["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             render_sources_expander(message.get("sources"))
 
-    # Saisie utilisateur
     prompt = st.chat_input("Votre question...")
     if prompt:
         chat["messages"].append({"role": "user", "content": prompt})
@@ -468,6 +521,7 @@ def render_chat() -> None:
             render_sources_expander(sources)
 
         chat["messages"].append({"role": "assistant", "content": answer, "sources": sources})
+        save_chats_to_disk()
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +529,7 @@ def render_chat() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Initialise l'état de session puis affiche la sidebar et le chat."""
     init_session_state()
     render_sidebar()
     render_chat()

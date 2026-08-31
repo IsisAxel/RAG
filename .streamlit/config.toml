@@ -4,3 +4,18 @@
 # il faut recharger la page manuellement (F5) après une modification du code
 # (au lieu du rerun automatique).
 fileWatcherType = "none"
+
+[theme]
+base = "dark"
+primaryColor = "#3E6FF0"
+backgroundColor = "#0B0F14"
+secondaryBackgroundColor = "#141A21"
+textColor = "#E7E9EC"
+linkColor = "#6C9BFF"
+borderColor = "#232A33"
+font = "sans-serif"
+codeFont = "monospace"
+baseRadius = "medium"
+buttonRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
